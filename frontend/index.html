@@ -277,6 +277,19 @@
             color: #ff9800;
         }
 
+        /* 求知型问题（“是什么/为什么/怎么”）不下真假结论，只用中性标题 */
+        .verdict.explain {
+            background: rgba(66, 165, 245, 0.15);
+            border: 1px solid #42a5f5;
+            color: #64b5f6;
+        }
+
+        .verdict.unknown {
+            background: rgba(120, 144, 156, 0.15);
+            border: 1px solid #78909c;
+            color: #b0bec5;
+        }
+
         .truth-section,
         .origin-section {
             margin-bottom: 20px;
@@ -329,6 +342,12 @@
             background: rgba(255, 152, 0, 0.2);
             border: 1px solid #ff9800;
             color: #ff9800;
+        }
+
+        .confidence-badge.low {
+            background: rgba(244, 67, 54, 0.2);
+            border: 1px solid #f44336;
+            color: #f44336;
         }
 
         .related-questions {
@@ -1856,7 +1875,7 @@
                 const res = await fetch(API_BASE + '/api/ask', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ question })
+                    body: JSON.stringify({ query: question })
                 });
                 const data = await res.json();
                 renderApiAnswer(question, data);
@@ -1885,6 +1904,16 @@
                 };
                 const [cls, icon, text] = map[data.verdict] || ['partial', '🟡', '待考证'];
                 html += `<div class="verdict ${cls}">${icon} 真的假的? → ${text}</div>`;
+            } else if (data.refused) {
+                html += `<div class="verdict unknown">🚫 无法判断 · 没有找到可靠依据</div>`;
+            } else if (data.evidence_source === 'web') {
+                // 联网结果没有经过人工核校，不判真假，只标“搜索结果”
+                const strong = data.confidence === 'high';
+                html += `<div class="verdict ${strong ? 'explain' : 'unknown'}">
+                    🔎 搜索结果 · ${strong ? '有权威来源支撑' : '未确认来源'}</div>`;
+            } else {
+                // 用户问的是“是什么/为什么/怎么做”，回答的是知识，不是真假
+                html += `<div class="verdict explain">💡 问题讲解</div>`;
             }
 
             // 主体回答（科普 / 辟谣 Agent 输出）
@@ -1896,6 +1925,22 @@
                         ${data.source ? `<span class="source-tag">📚 来源: ${data.source}</span>` : ''}
                     </div>
                 </div>`;
+
+            // 联网搜索结果（本地库未命中时），逐条可点，方便用户自己核实
+            if (data.web_results && data.web_results.length) {
+                html += `<div class="origin-section">
+                    <div class="section-title">🔗 搜索结果（点开可核实）</div>
+                    <div class="section-content">`;
+                data.web_results.forEach((r, i) => {
+                    const tag = r.authoritative ? ' · 权威来源' : '';
+                    html += `<p style="margin:6px 0;font-size:13px;">
+                        [${i + 1}] <a href="${r.url}" target="_blank" rel="noopener"
+                            style="color:#64b5f6;text-decoration:none;">${r.title}</a>
+                        <span style="color:#78909c;font-size:12px;">${tag}</span>
+                    </p>`;
+                });
+                html += `</div></div>`;
+            }
 
             // 误解溯源（辟谣链路特有，PRD 亮点）
             if (data.origin || data.why) {
@@ -1910,13 +1955,17 @@
             }
 
             // 置信度（审查 Agent，PRD 第七章三级置信度）
-            const cls = data.confidence === 'high' ? 'high' : 'medium';
+            const cls = data.confidence === 'high' ? 'high'
+                : data.confidence === 'low' ? 'low' : 'medium';
             html += `<div class="confidence-badge ${cls}">${data.confidence_label || ''}</div>`;
 
             // 调试信息：命中条数 + 当前模型（面试时可展示架构在工作）
             html += `<p style="font-size:11px;color:#78909c;margin-top:10px;">
-                🔀 路由: ${data.route === 'debunk' ? '辟谣链路' : '冷知识链路'}
+                🔀 意图: ${data.intent === 'verify' ? '求证真假' : '询问知识'}
+                ｜ 路由: ${data.route === 'debunk' ? '辟谣链路' : '冷知识链路'}
+                ｜ 来源: ${data.evidence_source === 'web' ? '联网搜索' : data.evidence_source === 'none' ? '无' : '本地知识库'}
                 ｜ 命中知识库: ${data.materials_hit} 条
+                ${data.refused ? '｜ 🚫 无可靠证据，已拒答' : ''}
                 ｜ 模型: ${data.provider}</p>`;
             html += '</div>';
 

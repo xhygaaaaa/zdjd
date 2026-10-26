@@ -2,7 +2,7 @@
 
 > 一个基于**多 Agent 协同**与 **RAG 检索**的 AI 科普问答系统。用户既能探索有趣的冷知识，也能验证网络流传说法的真假，并追溯误解的起源。
 >
-> 前端复刻科技感深色 UI，后端用 FastAPI 编排多个职责单一的 Agent，内置 200 条精选知识库，支持三级置信度防幻觉机制。
+> 前端复刻科技感深色 UI，后端用 FastAPI 编排多个职责单一的 Agent，内置 209 条精选知识库，支持三级置信度防幻觉机制。
 
 ![tech](https://img.shields.io/badge/backend-FastAPI-009688) ![llm](https://img.shields.io/badge/LLM-MiniMax%20%7C%20DeepSeek-orange) ![arch](https://img.shields.io/badge/architecture-Multi--Agent%20%2B%20RAG-blue)
 
@@ -41,7 +41,7 @@
               答案 + 真相溯源 + 误解溯源 + 相关推荐
 ```
 
-> 架构完整对应 [PRD 文档](./docs/PRD.md) 第五章。为控制真实 API 成本，执行层将 8 个 Agent 合并为 2-3 次大模型调用，但每个 Agent 的职责与 Prompt 均独立定义，便于讲解与横向扩展。
+> 架构完整对应 [PRD 文档](./docs/PRD.md) 第五章。系统共 **7 个功能 Agent**（检索 / 科普 / 辟谣 / 误解溯源 / 溯源 / 延伸 / 审查）+ 1 个总调度 Orchestrator。每个 Agent 都是「知识库优先 + LLM 兜底」双通道：命中本地库直接用结构化字段，未命中才耗 LLM，兼顾质量与成本。
 
 ---
 
@@ -59,7 +59,7 @@ zhende-jiade/
 │   ├── knowledge_base.py   # RAG 检索
 │   └── data/
 │       ├── knowledge.json        # 基础知识库
-│       └── knowledge_extra.json  # 扩充知识库（合计约 200 条）
+│       └── knowledge_extra.json  # 扩充知识库（合计 209 条）
 ├── docs/
 │   └── PRD.md              # 完整产品需求文档
 ├── requirements.txt
@@ -109,7 +109,7 @@ LLM_MODEL=abab6.5s-chat
 ```bash
 curl -X POST http://localhost:8000/api/ask \
   -H "Content-Type: application/json" \
-  -d '{"question": "鱼的记忆只有7秒吗？"}'
+  -d '{"query": "鱼的记忆只有7秒吗？"}'
 ```
 
 **响应示例**
@@ -125,7 +125,8 @@ curl -X POST http://localhost:8000/api/ask \
   "confidence": "high",
   "confidence_label": "🟢 确证 · 有权威来源",
   "related": ["🐙 章鱼有3个心脏和蓝色血液", "..."],
-  "route_hit": 1
+  "materials_hit": 1,
+  "provider": "deepseek"
 }
 ```
 
@@ -143,7 +144,7 @@ curl -X POST http://localhost:8000/api/ask \
    采用「精选库 + 检索 + 主题轮换」策略——本地存高质量精选，命中优先返回结构化答案；未命中降级到大模型生成，体现 RAG「按需检索」的核心思想。
 
 4. **成本与效果如何权衡？**
-   8 个 Agent 的完整链路在执行层合并为 2-3 次调用：检索/翻译/溯源/延伸靠本地完成，只有生成和审查消耗 LLM，兼顾架构清晰度与调用成本。
+   7 个 Agent 中，检索 / 溯源 / 审查走本地逻辑（零 LLM），只有路由、科普/辟谣、误解溯源、延伸在真实模式下才调大模型；且命中知识库时兜底调用自动省去。单次提问的 LLM 调用控制在 2-4 次，兼顾架构清晰度与成本。
 
 ---
 

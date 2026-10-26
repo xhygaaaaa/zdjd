@@ -22,9 +22,12 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 # 加载 .env（可选依赖，没装也能跑）
+# 注意：服务从 backend/ 启动，而 .env 在其上一级目录 zhende-jiade/，
+# python-dotenv 默认只在当前工作目录找，必须显式指定路径，否则密钥读不到会退回 mock。
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    _ENV_PATH = os.path.join(os.path.dirname(__file__), "..", ".env")
+    load_dotenv(_ENV_PATH)
 except ImportError:
     pass
 
@@ -54,7 +57,7 @@ CATEGORIES = [
 
 
 class AskRequest(BaseModel):
-    question: str
+    query: str
 
 
 @app.get("/api/categories")
@@ -80,9 +83,9 @@ def ask(req: AskRequest):
     核心问答接口：调用 Orchestrator 走多 Agent 链路。
     返回结构见 orchestrator.handle 的文档。
     """
-    if not req.question.strip():
+    if not req.query.strip():
         return {"error": "问题不能为空"}
-    result = orchestrator.handle(req.question.strip())
+    result = orchestrator.handle(req.query.strip())
     result["provider"] = orchestrator_provider()
     return result
 
