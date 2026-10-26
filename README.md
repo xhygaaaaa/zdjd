@@ -14,8 +14,12 @@
 |------|------|---------|
 | **多 Agent 协同** | 总调度 Agent 判断问题类型，动态分发到「冷知识链路」或「辟谣链路」 | `orchestrator.py` |
 | **RAG 检索** | 本地精选知识库 + 关键词加权检索，命中优先用高质量结构化答案 | `knowledge_base.py` |
-| **误解双重溯源** | 辟谣时不仅给真相，还追溯「误解从哪来」「为什么流传」（核心差异化） | `agents.py::MisconceptionOriginAgent` |
+| **误解双重溯源** | 辟谣时不仅给真相，还追溯「误解从哪来」「为什么流传」，并标注是库内原文还是模型推断 | `agents.py::MisconceptionOriginAgent` |
 | **三级置信度防幻觉** | 🟢确证 / 🟡趣味参考 / 🔴存疑，无可靠资料时诚实拒答 | `agents.py::ReviewAgent` |
+| **生成后事实核查** | 逐条主张核对证据支撑率；区分「核心结论 / 解释性细节」，核心主张支撑过低才降级置信度、甚至改判拒答 | `verification.py` |
+| **可核实证据链** | 返回检索到的每条证据（标题/来源/片段/链接），前端可展开核对 | `orchestrator.py::_evidence_chain` |
+| **编排轨迹** | 每个 Agent 的耗时随响应返回，便于定位慢点与演示链路 | `orchestrator.py::handle` |
+| **可复现评测** | 离线跑辟谣/冷知识/超纲题，落盘 source/grounding/citation/verdict 指标 | `backend/evaluate.py` |
 | **可插拔大模型** | 默认 mock 模式开箱即跑；填 Key 即接入 MiniMax，一行配置切 DeepSeek | `llm_client.py` |
 
 ---
@@ -41,7 +45,9 @@
               答案 + 真相溯源 + 误解溯源 + 相关推荐
 ```
 
-> 架构完整对应 [PRD 文档](./docs/PRD.md) 第五章。系统共 **7 个功能 Agent**（检索 / 科普 / 辟谣 / 误解溯源 / 溯源 / 延伸 / 审查）+ 1 个总调度 Orchestrator。每个 Agent 都是「知识库优先 + LLM 兜底」双通道：命中本地库直接用结构化字段，未命中才耗 LLM，兼顾质量与成本。
+> 架构完整对应 [PRD 文档](./docs/PRD.md) 第五章。系统共 **7 个功能 Agent**（检索 / 科普 / 辟谣 / 误解溯源 / 溯源 / 延伸 / 审查）+ 1 个总调度 Orchestrator；代码里另有意图分类、检索改写、联网兜底三类辅助 Agent，总计 10 个 Agent 类。
+>
+> 需要说明的是：这里的「多 Agent」是**确定性的职责编排**——Orchestrator 按固定顺序调用各 Agent，每个 Agent 只做一次模型调用，不做自主工具选择或多步规划。它换来的是可解释、可评测、成本可控；不是 AutoGPT 式的自主智能体。生成完成后还有一次 `GroundingVerifier` 核对回答是否被证据支撑。
 
 ---
 
@@ -94,6 +100,39 @@ LLM_BASE_URL=https://api.minimax.chat/v1
 LLM_MODEL=abab6.5s-chat
 ```
 重启服务即可切换到真实大模型。切 DeepSeek 只需改 4 个环境变量。
+
+### 5. 运行离线评测
+```bash
+cd backend
+# mock 模式冒烟（无需 Key，结果稳定）
+python evaluate.py --limit 8 --no-web
+
+# 真实模型评测（需要 .env 已配置；每轮会调用多次模型）
+set -a && . ../.env && set +a
+python evaluate.py --limit 12 --no-web
+```
+指标定义与结果落盘在 `backend/evaluation/results/run_*/`：
+`source_rate`（来源标注率）、`grounding_rate`（有据可查率）、
+`citation_rate`（证据链完整率）、`verdict_accuracy`、`refusal_accuracy`。
+
+**生成后核查阈值**（可在 `.env` 覆盖）：
+```bash
+VERIFY_SUPPORT_THRESHOLD=0.5   # 低于此值降级置信度
+VERIFY_REFUSE_THRESHOLD=0.3    # 低于此值改判拒答
+```
+
+**已测结果（DeepSeek，15 题，`--no-web`，seed=42）**
+
+| 指标 | 数值 | 含义 |
+|------|------|------|
+| source_rate | 100% | 回答都带来源与证据链 |
+| grounding_rate | 91.7% | 核心主张被证据支撑的比例（阈值 0.5） |
+| citation_rate | 100% | 证据链每条都有可读片段 |
+| verdict_accuracy | 83.3% | 辟谣结论与知识库标注一致 |
+| refusal_accuracy | 100% | 超纲题全部正确拒答 |
+| verifiable_rate | 93.3% | 上述指标的综合通过率 |
+
+结果目录：`backend/evaluation/results/run_20261026_144449/`（逐题明细 + summary）。
 
 ---
 
