@@ -137,6 +137,23 @@ class WebSearchAgent:
 
     # ------------------------------------------------------------------
     @staticmethod
+    def _resolve(url: str, timeout: float = 3.0) -> str:
+        """
+        搜索引擎给的是 /link?url= 跳转链接，域名永远是搜索引擎自己，
+        没法判断来源权威性，用户点开也多一跳。这里跟一次重定向拿真实地址。
+        """
+        try:
+            resp = requests.get(
+                url, headers={"User-Agent": UA}, timeout=timeout,
+                allow_redirects=True, stream=True,
+            )
+            final = resp.url
+            resp.close()
+            return final or url
+        except Exception:
+            return url
+
+    @staticmethod
     def _is_authoritative(url: str) -> bool:
         host = urllib.parse.urlparse(url).netloc.lower()
         return any(host == d or host.endswith("." + d) for d in AUTHORITATIVE_DOMAINS)
@@ -154,6 +171,74 @@ class WebSearchAgent:
         need = 1 if len(query_bigrams) <= 3 else 2
         return hits >= need
 
+    # ------------------------------------------------------------------
+    def _pubmed(self, q: str, limit: int = 3) -> list:
+        """
+        PubMed 免费接口（无需 key）：中文网页几乎不会落在学术域名上，
+        所以要真正实现“有论文支撑 = 高置信度”，必须单独查一次论文库。
+        """
+        try:
+            r = requests.get(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+                params={"db": "pubmed", "term": q, "retmode": "json", "retmax": limit},
+                timeout=self.timeout,
+            )
+            ids = r.json().get("esearchresult", {}).get("idlist", [])
+            if not ids:
+                return []
+            s = requests.get(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+                params={"db": "pubmed", "id": ",".join(ids), "retmode": "json"},
+                timeout=self.timeout,
+            )
+            data = s.json().get("result", {})
+        except Exception:
+            return []
+
+        # 只有标题和期刊名，模型没法据此回答，必须把摘要取回来
+        abstracts = self._pubmed_abstracts(ids[:2])
+
+        out = []
+        for pid in ids:
+            info = data.get(pid, {})
+            title = (info.get("title") or "").strip()
+            if not title:
+                continue
+            journal = info.get("fulljournalname") or info.get("source") or ""
+            year = (info.get("pubdate") or "")[:4]
+            abstract = abstracts.get(pid, "")
+            snippet = abstract or f"PubMed 收录论文 · {journal} {year}"
+            out.append({
+                "title": f"{title}（{journal} {year}）".strip(),
+                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pid}/",
+                "snippet": snippet,
+                "authoritative": True,
+            })
+        return out
+
+    def _pubmed_abstracts(self, ids: list) -> dict:
+        """efetch 取摘要纯文本，按 PMID 分块；失败返回空字典，不影响主流程。"""
+        try:
+            text = requests.get(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+                params={"db": "pubmed", "id": ",".join(ids), "retmode": "xml"},
+                timeout=self.timeout + 3,
+            ).text
+        except Exception:
+            return {}
+
+        # text 模式不带 PMID 标记，没法把摘要和结果对上，所以用 XML 解析
+        result = {}
+        for record in re.split(r"<PubmedArticle>", text)[1:]:
+            pmid = re.search(r"<PMID[^>]*>(\d+)</PMID>", record)
+            if not pmid:
+                continue
+            parts = re.findall(r"<AbstractText[^>]*>(.*?)</AbstractText>", record, re.S)
+            body = _WS_RE.sub(" ", _clean(" ".join(parts))).strip()
+            if body:
+                result[pmid.group(1)] = body[:900]
+        return result
+
     def _parse_sogou(self, page: str) -> list:
         out = []
         for m in re.finditer(r"<h3[^>]*>(.*?)</h3>", page, re.S):
@@ -167,7 +252,7 @@ class WebSearchAgent:
         return out
 
     # ------------------------------------------------------------------
-    def search(self, query: str) -> list:
+    def search(self, query: str, en_query: str = "") -> list:
         """
         返回相关搜索结果；所有引擎都跑偏或网络异常时返回空列表（上层据此拒答）。
 
@@ -176,6 +261,12 @@ class WebSearchAgent:
         """
         q = self.build_query(query)
         query_bigrams = _bigrams(q)
+
+        # 论文库优先：命中就是最高质量的来源，且不受中文相关性闸门限制
+        papers = self._pubmed(en_query) if en_query else []
+        results = list(papers)
+        if len(results) >= self.top_k:
+            return results[:self.top_k]
 
         # Bing 排第一：它给的是直达链接，引用列表里用户点开就是原文；
         # 搜狗/360 给的是 /link?url= 跳转链接，域名永远是搜索引擎自己，无法判断权威性。
@@ -186,7 +277,7 @@ class WebSearchAgent:
             (self._baidu, self._parse_baidu, "https://www.baidu.com"),
         )
 
-        seen, results = set(), []
+        seen = {r["url"] for r in results}
         for fetch, parse, base in providers:
             try:
                 raw = parse(fetch(q))
@@ -202,6 +293,13 @@ class WebSearchAgent:
                 seen.add(url)
                 if not self._relevant(item, query_bigrams, q):
                     continue
+                # 只解析前 3 条的跳转链接，避免每条都多一次网络往返
+                host = urllib.parse.urlparse(url).netloc.lower()
+                if len(results) < 3 and any(
+                    h in host for h in ("so.com", "sogou.com", "baidu.com")
+                ):
+                    url = self._resolve(url)
+                    item["url"] = url
                 item["authoritative"] = self._is_authoritative(url)
                 results.append(item)
                 if len(results) >= self.top_k:

@@ -13,6 +13,8 @@
 """
 
 import json
+import os
+import time
 
 from llm_client import llm
 from agents import (
@@ -28,7 +30,16 @@ from agents import (
     ReviewAgent,
     _parse_json,
 )
+from verification import GroundingVerifier
 from web_search import web_search
+
+# 生成后校验阈值：
+#   support < SUPPORT_THRESHOLD → 降级置信度
+#   support < REFUSE_THRESHOLD  → 隐藏回答并改判拒答
+VERIFY_SUPPORT_THRESHOLD = float(os.getenv("VERIFY_SUPPORT_THRESHOLD", "0.5"))
+VERIFY_REFUSE_THRESHOLD = float(os.getenv("VERIFY_REFUSE_THRESHOLD", "0.3"))
+# 启发式校验噪声大，只在极低覆盖时才拒答
+VERIFY_HEURISTIC_REFUSE = float(os.getenv("VERIFY_HEURISTIC_REFUSE", "0.15"))
 
 
 class Orchestrator:
@@ -43,6 +54,7 @@ class Orchestrator:
         self.source = SourceAgent()
         self.extension = ExtensionAgent()
         self.review = ReviewAgent()
+        self.verifier = GroundingVerifier()
 
     # ------------------------------------------------------------------
     def _route(self, query: str):
@@ -104,6 +116,81 @@ class Orchestrator:
             or m.get("_title_overlap", 0) >= 2
         ]
 
+    @staticmethod
+    def _evidence_chain(materials: list) -> list:
+        """把本地检索结果整理成可核实的证据链。
+
+        注意：本地库目前大多数条目没有 URL，url 为空时前端只展示
+        「标题 + 来源 + 证据片段」，不伪造链接。
+        """
+        chain = []
+        for m in materials:
+            chain.append({
+                "title": m.get("title", ""),
+                "source": m.get("source", ""),
+                "type": m.get("type", ""),
+                "url": m.get("url") or m.get("link") or "",
+                "snippet": (m.get("truth") or m.get("answer") or m.get("preview") or "")[:240],
+                "verdict": m.get("verdict"),
+                "score": m.get("_score"),
+            })
+        return chain
+
+    @staticmethod
+    def _web_evidence_chain(results: list) -> list:
+        return [{
+            "title": r.get("title", ""),
+            "source": "联网搜索",
+            "type": "web",
+            "url": r.get("url", ""),
+            "snippet": (r.get("snippet") or "")[:240],
+            "authoritative": bool(r.get("authoritative")),
+            "score": None,
+        } for r in results]
+
+    def _apply_verification(self, resp: dict, materials: list, query: str) -> dict:
+        """生成后核查：按证据支撑率降级置信度，极低时改判拒答。"""
+        verification = self.verifier.run(
+            query, resp.get("answer", ""), materials, resp.get("verdict"),
+        )
+        resp["verification"] = verification
+
+        support = verification.get("support_ratio")
+        if support is None:
+            return resp
+
+        mode = verification.get("mode")
+        refuse_threshold = (
+            VERIFY_HEURISTIC_REFUSE if mode == "heuristic" else VERIFY_REFUSE_THRESHOLD
+        )
+
+        if not verification.get("consistent", True):
+            resp["confidence"] = "low"
+            resp["confidence_label"] = "🔴 结论与检索证据冲突 · 建议核实"
+            resp["verdict"] = None
+            return resp
+
+        if support < VERIFY_SUPPORT_THRESHOLD:
+            resp["confidence"] = "low" if support < refuse_threshold else "medium"
+            resp["confidence_label"] = (
+                "🔴 生成内容缺乏证据支撑 · 建议核实"
+                if support < refuse_threshold
+                else "🟡 部分结论缺少证据 · 建议核实"
+            )
+
+        if support < refuse_threshold:
+            # 诚实拒答从「检索层」扩展到「生成层」：检索有资料，
+            # 但生成的回答核对后大部分没有依据，也不展示。
+            resp["refused"] = True
+            resp["verdict"] = None
+            resp["truth"] = ""
+            resp["answer"] = (
+                "抱歉，我生成了回答，但逐条核对后发现其中大部分内容在现有资料里找不到依据，"
+                "因此不展示未经验证的结论。你可以换一种问法，或补充更具体的说法；"
+                "涉及健康、安全的判断建议咨询专业人士。"
+            )
+        return resp
+
     def _web_answer(self, query: str, route: str, intent: str, results: list) -> dict:
         """
         本地库无依据时的第二来源：联网搜索 + 引用编号。
@@ -115,9 +202,12 @@ class Orchestrator:
         answer = self.web_answer.run(query, results)
         has_authority = any(r.get("authoritative") for r in results)
 
-        # 模型自己都说“搜不到”，就不该挂高置信度
+        # 只有“结论就是不知道”才降级；中途说某条结果没有相关内容属于正常分析。
+        # 所以只看开头和结尾，不在全文里抓“未/无法”这类字样。
+        headline = answer[:80] + answer[-120:]
         uncertain = any(
-            k in answer for k in ("无法确认", "未提及", "没有找到", "未涉及", "不足以", "未找到")
+            k in headline
+            for k in ("无法确认", "无法确定", "不足以", "未找到", "没有找到", "建议咨询专业人士")
         )
         if uncertain:
             level, label = "low", "🟡 搜索结果不足以确认 · 仅供参考"
@@ -133,6 +223,7 @@ class Orchestrator:
             "answer": answer,
             "truth": "",
             "origin": "",
+            "origin_provenance": "none",
             "why": "",
             "source": f"联网搜索 · {len(results)} 条结果（本地知识库未命中）",
             "confidence": level,
@@ -140,8 +231,12 @@ class Orchestrator:
             "related": [],
             "materials_hit": 0,
             "materials_candidates": 0,
-            "refused": False,
+            # 搜索结果不足以确认时，和本地无证据一样按「拒答」处理，
+            # 不再出现「回答里写无法确认、refused 却是 False」的矛盾状态。
+            "refused": bool(uncertain),
             "evidence_source": "web",
+            "evidence_chain": self._web_evidence_chain(results),
+            "verification": None,
             "web_results": results,
         }
 
@@ -158,6 +253,7 @@ class Orchestrator:
             ),
             "truth": "",
             "origin": "",
+            "origin_provenance": "none",
             "why": "",
             "source": "暂无可靠来源",
             "confidence": "low",
@@ -166,6 +262,8 @@ class Orchestrator:
             "materials_hit": 0,
             "materials_candidates": candidates,
             "refused": True,
+            "evidence_chain": [],
+            "verification": None,
         }
 
     # ------------------------------------------------------------------
@@ -174,27 +272,49 @@ class Orchestrator:
         主流程。返回统一响应结构，字段对齐前端渲染需求：
         {
           route, intent, verdict, answer, truth, origin, why,
-          source, confidence, confidence_label, related, materials_hit, refused
+          source, confidence, confidence_label, related, materials_hit, refused,
+          evidence_chain, verification, agent_trace
         }
         """
-        intent, route = self._route(query)
+        trace = []
+
+        def timed(name, fn, *args, **kwargs):
+            """记录每个 Agent 的耗时，供前端/评测展示编排轨迹。"""
+            started = time.perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                trace.append({
+                    "agent": name,
+                    "ms": round((time.perf_counter() - started) * 1000, 1),
+                })
+
+        intent, route = timed("IntentAgent", self._route, query)
 
         # 第 2 步：检索 Agent（本地 RAG，不耗 LLM），按路由重排 + 证据过滤
-        candidates = self.retrieval.run(query)
+        candidates = timed("RetrievalAgent", self.retrieval.run, query)
         materials = self._evidence_for_route(
             self._rank_for_route(candidates, route), route
         )
 
         # 本地没有直接证据 → 先联网搜；搜不到才诚实拒答
         if not materials:
-            # 先把问句改写成检索式，再联网；改写失败就用原句
-            search_query = self.rewrite.run(query) if llm.provider != "mock" else query
-            results = web_search.search(search_query)
+            # 先把问句改写成检索式（中文查网页 / 英文查 PubMed），改写失败用原句
+            rewritten = (
+                timed("QueryRewriteAgent", self.rewrite.run, query)
+                if llm.provider != "mock" else {"zh": query, "en": ""}
+            )
+            results = timed("WebSearchAgent", web_search.search,
+                            rewritten["zh"], rewritten.get("en", ""))
             if results:
-                return self._web_answer(query, route, intent, results)
-            return self._refuse(route, len(candidates), intent)
+                resp = self._web_answer(query, route, intent, results)
+                resp["agent_trace"] = trace
+                return resp
+            resp = self._refuse(route, len(candidates), intent)
+            resp["agent_trace"] = trace
+            return resp
 
-        review = self.review.run(materials)
+        review = timed("ReviewAgent", self.review.run, materials)
         top = materials[0]
 
         resp = {
@@ -205,29 +325,44 @@ class Orchestrator:
             "answer": "",
             "truth": "",
             "origin": "",
+            "origin_provenance": "none",
             "why": "",
             "source": self.source.run(materials),
             "confidence": review["level"],
             "confidence_label": review["label"],
-            "related": self.extension.run(query, materials),
+            "related": [],
             "materials_hit": len(materials),
             "materials_candidates": len(candidates),
             "refused": False,
+            "evidence_chain": self._evidence_chain(materials),
+            "verification": None,
+            "agent_trace": trace,
         }
 
         if route == "debunk":
             # 辟谣链路：辟谣 Agent + 误解溯源 Agent
-            debunk_result = self.debunk.run(query, materials)
+            debunk_result = timed("DebunkAgent", self.debunk.run, query, materials)
             resp["answer"] = debunk_result.get("answer", "")
             resp["verdict"] = debunk_result.get("verdict") or top.get("verdict")
             resp["truth"] = debunk_result.get("truth", "") or top.get("truth", "")
-            origin = self.origin.run(query, materials)
+
+            origin = timed("MisconceptionOriginAgent",
+                           self.origin.run, query, materials)
             resp["origin"] = origin["origin"]
             resp["why"] = origin["why"]
+            resp["origin_provenance"] = (
+                "knowledge_base"
+                if any(m.get("origin") or m.get("why") for m in materials)
+                else ("llm_inference" if llm.provider != "mock" else "none")
+            )
         else:
             # 冷知识链路：科普 Agent
-            resp["answer"] = self.science.run(query, materials)
+            resp["answer"] = timed("SciencePopAgent",
+                                   self.science.run, query, materials)
             resp["truth"] = top.get("truth", "")
+
+        resp["related"] = timed("ExtensionAgent",
+                                self.extension.run, query, materials)
 
         # 只有“求证型”问题才给真假结论；问“是什么/为什么”不下真假判断，
         # 否则会出现“屎是什么味道的 → 假的！”这种答非所问的标题。
@@ -239,6 +374,10 @@ class Orchestrator:
         # mock 模式下用库内整理好的答案覆盖占位文本，演示更稳定
         if llm.provider == "mock":
             resp["answer"] = top.get("answer", resp["answer"])
+
+        # 第 3 步：生成后核查（原实现只在生成前看检索元数据）
+        resp = timed("GroundingVerifier",
+                     self._apply_verification, resp, materials, query)
 
         return resp
 

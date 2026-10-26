@@ -1,0 +1,12 @@
+{
+  "n": 8,
+  "in_scope_n": 6,
+  "out_of_scope_n": 2,
+  "source_rate": 1.0,
+  "grounding_rate": 1.0,
+  "verifiable_rate": 1.0,
+  "citation_rate": 1.0,
+  "verdict_accuracy": 0.0,
+  "refusal_accuracy": 1.0,
+  "in_scope_refused": 0
+}

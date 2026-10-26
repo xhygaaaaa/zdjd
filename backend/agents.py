@@ -139,19 +139,22 @@ class QueryRewriteAgent:
     """
 
     SYSTEM_PROMPT = (
-        "把用户问题改写成适合搜索引擎的关键词，只返回 JSON："
-        "{\"query\":\"关键词1 关键词2\"}。要求：保留核心实体，去掉“是什么/为什么/吗”"
-        "等疑问词，2-5 个关键词，空格分隔，不要标点和解释。"
+        "把用户问题改写成搜索关键词，只返回 JSON："
+        "{\"zh\":\"中文关键词\",\"en\":\"english keywords\"}。"
+        "zh 保留核心实体，去掉“是什么/为什么/吗”等疑问词，2-5 个词；"
+        "en 用英文给同等意思的学术检索词，3-6 个词，用于查论文库。"
+        "不要标点和解释。"
     )
 
-    def run(self, query: str) -> str:
+    def run(self, query: str) -> dict:
+        """返回 {'zh': 中文检索式, 'en': 英文检索式}；解析失败就原样退回。"""
         raw = llm.chat(self.SYSTEM_PROMPT, query, temperature=0)
         data = _parse_json(raw, None)
         if isinstance(data, dict):
-            q = str(data.get("query", "")).strip()
-            if q:
-                return q
-        return query
+            zh = str(data.get("zh", "")).strip() or query
+            en = str(data.get("en", "")).strip()
+            return {"zh": zh, "en": en}
+        return {"zh": query, "en": ""}
 
 
 # ---------------------------------------------------------------------------

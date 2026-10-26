@@ -1944,14 +1944,52 @@
 
             // 误解溯源（辟谣链路特有，PRD 亮点）
             if (data.origin || data.why) {
+                const prov = data.origin_provenance === 'knowledge_base'
+                    ? '知识库原文' : data.origin_provenance === 'llm_inference'
+                    ? '模型推断，非知识库原文' : '';
                 html += `
                     <div class="origin-section">
                         <div class="section-title">🕵️ 误解从哪来</div>
                         <div class="section-content">
                             ${data.origin ? `<p><strong>起源:</strong> ${data.origin}</p>` : ''}
                             ${data.why ? `<p><strong>为什么流传:</strong> ${data.why}</p>` : ''}
+                            ${prov ? `<p style="font-size:12px;color:#78909c;">溯源方式：${prov}</p>` : ''}
                         </div>
                     </div>`;
+            }
+
+            // 证据链：逐条列出检索到的依据，可核实
+            if (data.evidence_chain && data.evidence_chain.length) {
+                html += `<div class="origin-section">
+                    <div class="section-title">🧾 证据链（${data.evidence_chain.length} 条）</div>
+                    <div class="section-content">`;
+                data.evidence_chain.forEach((e, i) => {
+                    const title = e.url
+                        ? `<a href="${e.url}" target="_blank" rel="noopener"
+                              style="color:#64b5f6;text-decoration:none;">${e.title}</a>`
+                        : `${e.title}`;
+                    const related = e.verdict
+                        ? ` · 库内结论：${e.verdict === 'true' ? '真' : e.verdict === 'fake' ? '假' : '部分正确'}`
+                        : '';
+                    html += `<p style="margin:8px 0;font-size:13px;">
+                        [${i + 1}] ${title}
+                        <span style="color:#78909c;font-size:12px;">${e.source || ''}${related}</span>
+                        <br><span style="color:#b0bec5;font-size:12px;">${e.snippet || ''}</span>
+                    </p>`;
+                });
+                html += `</div></div>`;
+            }
+
+            // 生成后核查：回答是否真的被证据支撑（不只是检索命中）
+            if (data.verification && data.verification.support_ratio != null) {
+                const ratio = Math.round(data.verification.support_ratio * 100);
+                const vcls = ratio >= 80 ? 'high' : ratio >= 50 ? 'medium' : 'low';
+                const missing = (data.verification.unsupported_claims || []).length;
+                html += `<div class="confidence-badge ${vcls}">
+                    🔍 生成后核查：证据支撑 ${ratio}%
+                    ${missing ? ` · ${missing} 条主张缺证据` : ''}
+                    <span style="font-size:11px;opacity:.8;">（${data.verification.mode}）</span>
+                </div>`;
             }
 
             // 置信度（审查 Agent，PRD 第七章三级置信度）
@@ -1959,14 +1997,17 @@
                 : data.confidence === 'low' ? 'low' : 'medium';
             html += `<div class="confidence-badge ${cls}">${data.confidence_label || ''}</div>`;
 
-            // 调试信息：命中条数 + 当前模型（面试时可展示架构在工作）
+            // 调试信息：命中条数 + 编排轨迹 + 当前模型（面试时可展示架构在工作）
+            const trace = (data.agent_trace || [])
+                .map(t => `${t.agent} ${t.ms}ms`).join(' → ');
             html += `<p style="font-size:11px;color:#78909c;margin-top:10px;">
                 🔀 意图: ${data.intent === 'verify' ? '求证真假' : '询问知识'}
                 ｜ 路由: ${data.route === 'debunk' ? '辟谣链路' : '冷知识链路'}
                 ｜ 来源: ${data.evidence_source === 'web' ? '联网搜索' : data.evidence_source === 'none' ? '无' : '本地知识库'}
                 ｜ 命中知识库: ${data.materials_hit} 条
                 ${data.refused ? '｜ 🚫 无可靠证据，已拒答' : ''}
-                ｜ 模型: ${data.provider}</p>`;
+                ｜ 模型: ${data.provider}
+                ${trace ? `<br>⛓️ 编排轨迹: ${trace}` : ''}</p>`;
             html += '</div>';
 
             // 延伸推荐（延伸 Agent）
